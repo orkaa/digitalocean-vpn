@@ -1,0 +1,374 @@
+#!/bin/bash
+
+set -eu -o pipefail
+
+usage () {
+    echo "Usage: digitalocean-vpn {create|sleep|wake|config|destroy|status|ssh}
+
+    Commands:
+        create    Creates the droplet from scratch
+        sleep     Removes the droplet and makes a snapshot of it
+        wake      Creates the droplet from snapshot (faster + you can reuse the config in tunnelblick)
+        config    Prints the openvpn client config to stdout
+        destroy   Destroys the droplet and deletes the snapshot if it exists
+        status    Prints the status of droplet, container and snapshot
+        ssh       Ssh to the running droplet
+        "
+    exit 1
+}
+
+cleanup () {
+    [ ! -z ${spinner_pid+x} ] && kill -9 $spinner_pid &> /dev/null
+}
+trap cleanup INT EXIT
+
+#### HELPER FUNCTIONS ####
+
+spinner () {
+    spin[0]="-"
+    spin[1]="\\"
+    spin[2]="|"
+    spin[3]="/"
+
+    echo -n "$1 ... ${spin[0]}"
+    while true
+    do
+      for i in "${spin[@]}"
+      do
+            echo -ne "\b$i"
+            sleep 0.1
+      done
+    done
+}
+
+start_spinner () {
+    spinner "$1" &
+    spinner_pid=$!
+    disown
+}
+
+stop_spinner () {
+    kill -PIPE $spinner_pid
+    if [[ $1 -eq 0 ]]
+    then
+        echo -e "\bDone."
+    else
+        echo -e "\bFailed!"
+    fi
+    unset spinner_pid
+}
+
+authorized_curl () {
+    curl --fail --silent -H 'Content-Type: application/json' \
+        -H 'Authorization: Bearer '$TOKEN'' "$@"
+}
+
+is_host_alive () {
+    ping -c 1 $1 &> /dev/null
+}
+
+get_droplet_id () {
+    authorized_curl -X GET "https://api.digitalocean.com/v2/droplets" \
+    | jq -r -e '.droplets | .[] | select (.name == "digitalocean-vpn") | .id'
+}
+
+get_droplet_ip () {
+    authorized_curl -X GET "https://api.digitalocean.com/v2/droplets/$(get_droplet_id)" \
+    | jq -r -e '.droplet .networks .v4[0] .ip_address'
+}
+
+get_ssh_key_id () {
+    authorized_curl -X GET "https://api.digitalocean.com/v2/account/keys" \
+    | jq -r -e '.ssh_keys | .[] | select (.name == "digitalocean-vpn") | .id'
+}
+
+get_snapshot_id () {
+    authorized_curl -X GET "https://api.digitalocean.com/v2/images?private=true" \
+    | jq -r -e '.images | .[] | select (.name == "digitalocean-vpn") | .id'
+}
+
+get_droplet_status () {
+    local droplet_id=$(get_droplet_id)
+    if [ -z $droplet_id ]
+    then
+        echo "nonexistent"
+    else
+        local droplet=$(authorized_curl -X GET "https://api.digitalocean.com/v2/droplets/$droplet_id")
+        echo $droplet | jq -r ".droplet .status"
+    fi
+}
+
+upload_ssh_key () {
+    local public_key=$(ssh-keygen -y -f ~/.ssh/id_rsa)
+    authorized_curl -X POST -d '{"name": "digitalocean-vpn", "public_key": "'"$public_key"'"}' "https://api.digitalocean.com/v2/account/keys" &> /dev/null
+}
+
+run_func_over_ssh () {
+    typeset -f $1 | ssh -o StrictHostKeyChecking=no root@$(get_droplet_ip) "$(cat);$1 "${@:2}""
+}
+
+get_openvpn_config () {
+    docker run --volumes-from ovpn-data --rm kylemanna/openvpn ovpn_getclient digitalocean-vpn-client
+}
+
+check_openvpn_running () {
+    docker ps | grep -q "openvpn"
+}
+
+check_api_accessible () {
+    authorized_curl -X GET "https://api.digitalocean.com/v2/account"
+}
+
+#### END OF HELPER FUNCTIONS ####
+
+#### FRONTEND FUNCTIONS ####
+update_hosts () {
+    echo ""
+    echo "Sudo password is needed for updating /etc/hosts"
+    echo ""
+    echo "Droplet ip will change when sleep/wake is performed."
+    echo "Keeping an entry in /etc/hosts allows reusing the same openvpn config"
+    entry="$(get_droplet_ip) digitalocean-vpn"
+    if ! grep -q "digitalocean-vpn" /etc/hosts;
+    then
+        echo "$entry" | sudo tee -a /etc/hosts > /dev/null
+    else
+        sudo sed -i "" "s/.*digitalocean-vpn/$entry/g" /etc/hosts
+    fi
+}
+
+create_droplet () {
+    local ssh_key_id=$(get_ssh_key_id)
+    [ -z $ssh_key_id ] && upload_ssh_key
+
+    start_spinner "Creating droplet"
+    authorized_curl -X POST \
+        -d '{"name":"digitalocean-vpn","region":"nyc3","size":"512mb","image":"'$1'","ssh_keys":["'"$ssh_key_id"'"],"backups":false,"ipv6":true,"user_data":null,"private_networking":null}' \
+        "https://api.digitalocean.com/v2/droplets" &> /dev/null
+    stop_spinner $?
+
+    start_spinner "Waiting for droplet's ip"
+    while [[ $(get_droplet_ip) == "null" ]]; do sleep 1; done
+    stop_spinner $?
+    ip=$(get_droplet_ip)
+
+    start_spinner "Waiting for the droplet to come online"
+    while ! is_host_alive "$ip" ; do sleep 1; done
+    stop_spinner $?
+}
+
+deploy_droplet () {
+    set -e
+    random_password=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+    apt-get update
+    apt-get -y install expect
+    docker run --name ovpn-data -v /etc/openvpn busybox
+    docker run --volumes-from ovpn-data --rm kylemanna/openvpn ovpn_genconfig -u udp://digitalocean-vpn
+    expect -c '
+        set timeout -1
+        spawn docker run --volumes-from ovpn-data --rm -it kylemanna/openvpn ovpn_initpki
+        expect "Enter PEM pass phrase:"
+        sleep .1
+        send -- "'$random_password'\r"        
+        expect "Verifying - Enter PEM pass phrase:"
+        sleep .1
+        send -- "'$random_password'\r"
+        expect "*\\\[Easy-RSA CA\\\]:"
+        sleep .1
+        send -- "\r"
+        expect "Enter pass phrase for /etc/openvpn/pki/private/ca.key:"
+        sleep .1
+        send -- "'$random_password'\r"
+        expect eof
+        catch wait reason
+        set exit_status [lindex $reason 3]
+        exit $exit_status
+    '
+    docker run --restart=always --name openvpn --volumes-from ovpn-data -d -p 1194:1194/udp --cap-add=NET_ADMIN kylemanna/openvpn
+    expect -c '
+        set timeout -1
+        spawn docker run --volumes-from ovpn-data --rm -it kylemanna/openvpn easyrsa build-client-full digitalocean-vpn-client nopass
+        expect "/etc/openvpn/pki/private/ca.key:"
+        sleep .1
+        send -- "'$random_password'\r"
+        expect eof
+        catch wait reason
+        set exit_status [lindex $reason 3]
+        exit $exit_status
+    '
+}
+
+destroy_droplet() {
+    authorized_curl -X DELETE "https://api.digitalocean.com/v2/droplets/$(get_droplet_id)"
+}
+
+remove_snapshot () {
+    authorized_curl -X DELETE "https://api.digitalocean.com/v2/images/$1"
+}
+
+sleep_droplet() {
+    local droplet_id=$(get_droplet_id)
+    if ! get_snapshot_id &> /dev/null
+    then
+        start_spinner "Stopping droplet"
+        authorized_curl -X POST "https://api.digitalocean.com/v2/droplets/$droplet_id/actions" \
+                -d '{"type":"power_off"}' &> /dev/null
+        while true
+        do
+            local droplet=$(authorized_curl -X GET "https://api.digitalocean.com/v2/droplets/$droplet_id")
+            local status=$(echo $droplet | jq -r ".droplet .status")
+            if [[ $status != "off" ]]
+            then
+                sleep 1
+            else
+                break
+            fi
+        done
+        stop_spinner $?
+
+        start_spinner "Creating snapshot"
+        authorized_curl -X POST "https://api.digitalocean.com/v2/droplets/$droplet_id/actions" \
+            -d '{"type":"snapshot","name":"digitalocean-vpn"}' &> /dev/null
+        while true
+        do
+            local snapshots=$(authorized_curl -X GET "https://api.digitalocean.com/v2/droplets/$droplet_id/snapshots")
+            if echo $snapshots | jq -r -e '.snapshots | .[] | select (.name == "digitalocean-vpn")' &> /dev/null
+            then
+                break
+            else
+                sleep 1
+            fi
+        done
+        stop_spinner $?
+    else
+        echo "Snapshot already exists ... Skipping."
+    fi
+
+    start_spinner "Destroying droplet"
+    while true
+    do
+        if destroy_droplet
+        then
+            break
+        else
+            sleep 1
+        fi
+    done
+    stop_spinner $?
+
+}
+
+wake_droplet () {
+    local snapshot_id=$(get_snapshot_id)
+    if [ -z $snapshot_id ]
+    then
+        echo "Digitalocean-vpn snapshot doesn't exist!"
+        echo "Run \`./digitocean-vpn create\` to proceed"
+    else
+        create_droplet "$snapshot_id"
+    fi
+}
+
+droplet_status() {
+    case $(get_droplet_status) in
+        nonexistent)
+            echo "Droplet doesn't exist." ;;
+        active)
+            echo "Droplet is running."
+            if run_func_over_ssh check_openvpn_running
+            then
+                echo -e "  \xE2\x94\x94 Docker openvpn container is running."
+            else
+                echo -e "  \xE2\x94\x94 Docker openvpn container is NOT running."
+            fi
+            ;;
+        new)
+            echo "Droplet is initializing." ;;
+        off)
+            echo "Droplet is powered off." ;;
+        *)
+            echo "Unknown state: $(get_droplet_status)" ;;
+    esac
+    if [ -z $(get_snapshot_id) ]
+    then
+        echo "There's no snapshot."
+    else
+        echo "Snapshot is available."
+    fi
+}
+
+#### END OF FRONTEND FUNCTIONS ####
+
+config_file=~/.digitalocean-vpn
+if [ ! -f $config_file ]
+then
+    cat > $config_file <<- EOM
+# Digitalocean API token
+TOKEN=
+EOM
+echo "Config file $config_file was created!"
+echo "Please review it and fill in the missing info"
+echo ""
+echo ""
+fi
+
+source $config_file
+
+if ! check_api_accessible &> /dev/null
+then
+    echo "Digitalocean API seems unavailable."
+    echo "Please provide working credentials."
+    exit 1
+fi
+
+[[ $# -eq 0 ]] && usage
+
+case "$1" in
+    create)
+        if ! get_droplet_id &> /dev/null
+        then
+            create_droplet "docker"
+            start_spinner "Deploying droplet"
+            run_func_over_ssh deploy_droplet &> /dev/null
+            stop_spinner $?
+            update_hosts
+        else
+            echo "Droplet already exists!"
+        fi
+        ;;
+    sleep)
+        sleep_droplet
+        ;;
+    wake)
+        wake_droplet
+        update_hosts
+        ;;
+    config)
+        run_func_over_ssh get_openvpn_config
+        ;;
+    destroy)
+        if get_droplet_id &> /dev/null
+        then
+            start_spinner "Destroying droplet"
+            destroy_droplet
+            while is_host_alive "$(get_droplet_ip)" ; do sleep 1; done
+            stop_spinner $?
+        fi
+        snapshot_id=$(get_snapshot_id)
+        if [ ! -z $snapshot_id ]
+        then
+            start_spinner "Removing snapshot"
+            remove_snapshot "$snapshot_id"
+            stop_spinner $?
+        fi
+        ;;
+    status)
+        droplet_status
+        ;;
+    ssh)
+        ssh root@$(get_droplet_ip)
+        ;;
+    *)
+        usage
+ 
+esac
