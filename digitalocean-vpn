@@ -13,7 +13,10 @@ usage () {
         destroy   Destroys the droplet and deletes the snapshot if it exists
         status    Prints the status of droplet, container and snapshot
         ssh       Ssh to the running droplet
-        "
+        
+    Options:
+        --debug   Runs the script with (set -x)
+    "
     exit 1
 }
 
@@ -323,13 +326,31 @@ fi
 
 [[ $# -eq 0 ]] && usage
 
+DEBUG=0
+if echo $@ | grep -q '\-\-debug'
+then
+    DEBUG=1
+    start_spinner () {
+        :
+    }
+    stop_spinner () {
+        :
+    }
+    set -x
+fi
+
 case "$1" in
     create)
         if ! get_droplet_id &> /dev/null
         then
             create_droplet "docker"
             start_spinner "Deploying droplet"
-            run_func_over_ssh deploy_droplet &> /dev/null
+            if [ $DEBUG -eq 1 ]
+            then
+                run_func_over_ssh deploy_droplet
+            else
+                run_func_over_ssh deploy_droplet &> /dev/null
+            fi
             stop_spinner $?
             update_hosts
         else
