@@ -59,7 +59,7 @@ stop_spinner () {
 }
 
 authorized_curl () {
-    curl --fail --silent -H 'Content-Type: application/json' \
+    curl --fail --silent --show-error -H 'Content-Type: application/json' \
         -H 'Authorization: Bearer '$TOKEN'' "$@"
 }
 
@@ -144,7 +144,7 @@ create_droplet () {
     start_spinner "Creating droplet"
     authorized_curl -X POST \
         -d '{"name":"digitalocean-vpn","region":"nyc3","size":"512mb","image":"'$1'","ssh_keys":["'"$ssh_key_id"'"],"backups":false,"ipv6":true,"user_data":null,"private_networking":null}' \
-        "https://api.digitalocean.com/v2/droplets" &> /dev/null
+        "https://api.digitalocean.com/v2/droplets" > /dev/null
     stop_spinner $?
 
     start_spinner "Waiting for droplet's ip"
@@ -212,7 +212,7 @@ sleep_droplet() {
     then
         start_spinner "Stopping droplet"
         authorized_curl -X POST "https://api.digitalocean.com/v2/droplets/$droplet_id/actions" \
-                -d '{"type":"power_off"}' &> /dev/null
+                -d '{"type":"power_off"}' > /dev/null
         while true
         do
             local droplet=$(authorized_curl -X GET "https://api.digitalocean.com/v2/droplets/$droplet_id")
@@ -228,7 +228,7 @@ sleep_droplet() {
 
         start_spinner "Creating snapshot"
         authorized_curl -X POST "https://api.digitalocean.com/v2/droplets/$droplet_id/actions" \
-            -d '{"type":"snapshot","name":"digitalocean-vpn"}' &> /dev/null
+            -d '{"type":"snapshot","name":"digitalocean-vpn"}' > /dev/null
         while true
         do
             local snapshots=$(authorized_curl -X GET "https://api.digitalocean.com/v2/droplets/$droplet_id/snapshots")
