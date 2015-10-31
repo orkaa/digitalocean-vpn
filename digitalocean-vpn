@@ -250,7 +250,7 @@ sleep_droplet() {
     start_spinner "Destroying droplet"
     while true
     do
-        if destroy_droplet
+        if destroy_droplet 2> /dev/null
         then
             break
         else
