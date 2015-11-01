@@ -5,6 +5,8 @@ Digitalocean-vpn is a tool written in bash that makes it easy to create a digita
 
 Digitalocean-vpn makes it possible to run the instance only when needed. Once you have it running, you can `sleep` and then `wake` it. While sleeping, droplet doesn't exist - only its snapshot does. Snapshot storage is currently free (written on November, 2015)!
 
+Under the hood, docker and kylemanna/docker-openvpn (https://github.com/kylemanna/docker-openvpn) are being used.
+
 Prerequisites
 =============
 
